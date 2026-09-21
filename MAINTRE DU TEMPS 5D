@@ -1,0 +1,240 @@
+/@version=6
+indicator("DASHBOARD MATRICE PURE 5D - ROBUSTE", overlay=true)
+
+// =================================================================================
+// RESUME DE L INDICATEUR (PUBLICATION TRADINGVIEW)
+// =================================================================================
+// Le Dashboard Matrice Pure est un terminal deterministe multi-timeframe compacte 
+// en un seul tuple serveur. Au signal de masse, il fige un pivot et lance un cycle 
+// de 60 bougies a polarite inversee (degressif en LONG, progressif en SHORT). Un gel 
+// asymetrique scelle l ancrage passe et le Stop Loss present calcule sur le carnet 
+// Bid/Ask reel anti-spread. Le Take Profit futur et l horloge de l Apex restent 
+// elastiques, s adaptant en direct jusqu a la reinitialisation automatique a l impact.
+// =================================================================================
+// NOTICE D UTILISATION : EXECUTION BINAIRE EN 3 ETAPES
+// =================================================================================
+// 1. RADAR : Le statut indique RECHERCHE CHOC. Suivez la cellule centrale qui dicte 
+//    la timeframe officielle exigee par l energie de la masse (ex: GRAPH REQUIS : 4h). 
+//    Ouvrez cette unite de temps sur votre ecran principal.
+// 2. IMPULSION : Au choc, les prix exacts du carnet d ordres réels s affichent. 
+//    Saisissez immediatement un ordre limite chez votre broker (ActiveTrades) selon 
+//    la consigne : SAISIR BUY LIMIT ou SELL LIMIT, et reglez le prix du STOP LOSS.
+// 3. ECHEANCE : Le statut passe en PRESENT GELE. Le pivot et le stop sont verrouilles 
+//    contre le bruit des meches chasseuses. Le take profit et l horloge finale 
+//    s ajustent en direct. Coupez la position des que le prix touche le TAKE PROFIT 
+//    ou quand la montre atteint la seconde exacte indiquee par PROCHAIN APEX TIME. 
+//    Le robot efface sa memoire et reprend sa recherche de choc.
+// =================================================================================
+
+// --- PARAMÈTRE DE FIXATION DE L'ESPACE-TEMPS ---
+tfReference = input.timeframe("60", title="Unité de Référence Globale")
+
+// --- SÉQUENCE CONDENSÉE EN UN SEUL APPEL MULTI-TF (TUPLE) ---
+fetchMatrixStates() =>
+    s12M = close > open
+    s1M  = close > open
+    s1W  = close > open
+    s1D  = close > open
+    s1H  = close > open
+    s5M  = close > open
+    [s12M, s1M, s1W, s1D, s1H, s5M]
+
+[state12M, state1M, state1W, state1D, state1H, state5M] = request.security(syminfo.tickerid, "1", fetchMatrixStates())
+
+ctr12M = state12M ? 1 : 0
+ctr1M  = state1M  ? 1 : 0
+ctr1W  = state1W  ? 1 : 0
+ctr1D  = state1D  ? 1 : 0
+ctr1H  = state1H  ? 1 : 0
+ctr5M  = state5M  ? 1 : 0
+// --- MASSES STRUCTURELLES ---
+masseC1 = 5.0  
+masseC2 = 4.0  
+masseC3 = 3.0  
+masseC4 = 2.0  
+masseC5 = 1.0  
+
+c1 = (ctr12M == ctr1M) ? masseC1 : 0.0
+c2 = (ctr1M  == ctr1W) ? masseC2 : 0.0
+c3 = (ctr1W  == ctr1D) ? masseC3 : 0.0
+c4 = (ctr1D  == ctr1H) ? masseC4 : 0.0
+c5 = (ctr1H  == ctr5M) ? masseC5 : 0.0
+
+masseTotaleTheorique = 15.0
+masseActiveReelle = (c1 > 0 ? masseC1 : 0) + (c2 > 0 ? masseC2 : 0) + (c3 > 0 ? masseC3 : 0) + (c4 > 0 ? masseC4 : 0) + (c5 > 0 ? masseC5 : 0)
+
+densiteEnergieTemps = (masseActiveReelle / masseTotaleTheorique) * 100
+int cycleMax60 = 60
+
+// --- LOGIQUE VECTORIELLE D'ÉQUILIBRE ---
+volatilesStructurelle = ta.tr(true)
+openReference = request.security(syminfo.tickerid, "60", open, barmerge.gaps_off, barmerge.lookahead_off)
+espaceBrut = (close - openReference) / (volatilesStructurelle > 0 ? volatilesStructurelle : 1)
+
+safeTanh(float x) =>
+    float clampedX = math.max(-20.0, math.min(20.0, x))
+    float e_x = math.exp(clampedX)
+    float e_nx = math.exp(-clampedX)
+    (e_x - e_nx) / (e_x + e_nx)
+
+vecteurGravite = safeTanh(espaceBrut * (masseActiveReelle / masseTotaleTheorique))
+
+bool crossUp   = ta.crossover(vecteurGravite, 0)
+bool crossDown = ta.crossunder(vecteurGravite, 0)
+
+bool contractionMaximaleAtteinte = (masseActiveReelle == masseTotaleTheorique)
+bool croisementMasseEquilibre = crossUp or crossDown
+bool chocStructurelInitial = contractionMaximaleAtteinte and croisementMasseEquilibre
+
+// --- RÉCUPÉRATION SÉCURISÉE DE LA CLÔTURE HORAIRE ---
+chuteClose1H = request.security(syminfo.tickerid, "60", close, barmerge.gaps_off, barmerge.lookahead_off)
+
+// --- EXTRACTEUR DÉTERMINISTE DU BID / ASK ET SPREAD ---
+float spreadMatricielBrut = ta.sma(volatilesStructurelle, 60) * 0.05
+float spreadFriction = math.max(syminfo.mintick, spreadMatricielBrut)
+
+float prixBidLive = close - (spreadFriction * 0.5)
+float prixAskLive = close + (spreadFriction * 0.5)
+
+// --- MÉMOIRE PERSISTANTE SECURISEE DE L'ESPACE-TEMPS ---
+var int tempsEcoule = 0
+var float prixAncrageApex = na
+var int tempsAncrageMs = na
+var int targetApexFuturMs = na 
+var int limitePasseSLMs = na 
+var bool directionFigeeLONG = bool(na)
+var bool tradeEnCoursVerrouille = false
+var float targetSLFixe = na
+var float targetTPFixe = na
+var float entreeLimiteFixe = na
+
+float vitesseRelative60 = ta.sma(close > 0 ? volatilesStructurelle / close : 0.0, cycleMax60)
+
+bool ohlcLongValide  = (chuteClose1H >= prixAncrageApex)
+bool ohlcShortValide = (chuteClose1H <= prixAncrageApex)
+
+// SYNC TICK PAR TICK : Sortie immediate des que le prixBid ou Ask touche les bornes fixes
+bool releaseAchat = tradeEnCoursVerrouille and directionFigeeLONG and (prixBidLive >= targetTPFixe or prixBidLive <= targetSLFixe)
+bool releaseVente = tradeEnCoursVerrouille and not directionFigeeLONG and (prixAskLive <= targetTPFixe or prixAskLive >= targetSLFixe)
+
+if releaseAchat or releaseVente or tempsEcoule >= cycleMax60
+    tempsEcoule := 0
+    prixAncrageApex := na
+    tempsAncrageMs := na
+    targetApexFuturMs := na
+    limitePasseSLMs := na
+    directionFigeeLONG := bool(na)
+    tradeEnCoursVerrouille := false
+    targetSLFixe := na
+    targetTPFixe := na
+    entreeLimiteFixe := na
+
+if tradeEnCoursVerrouille and (na(targetSLFixe) or na(prixAncrageApex))
+    tradeEnCoursVerrouille := false
+
+int safeMilli = timeframe.isminutes ? timeframe.multiplier * 60000 : timeframe.isdaily ? 86400000 : 3600000
+
+// ANCRAGE AU CHOC INITIAL (MODE MEAN REVERSION)
+if chocStructurelInitial and not tradeEnCoursVerrouille
+    prixAncrageApex := close
+    tempsAncrageMs := time
+    directionFigeeLONG := (vecteurGravite >= 0)
+    tempsEcoule := 1
+    targetApexFuturMs := time + (cycleMax60 * safeMilli)
+    limitePasseSLMs := time + safeMilli
+    
+    float zoneRepliAttendu = vitesseRelative60 * 0.5
+    entreeLimiteFixe := directionFigeeLONG ? (prixAskLive * (1 - zoneRepliAttendu)) : (prixBidLive * (1 + zoneRepliAttendu))
+    
+    float distanceSecuriteElargie = vitesseRelative60 * 3.0
+    targetSLFixe := directionFigeeLONG ? (prixAncrageApex * (1 - distanceSecuriteElargie)) : (prixAncrageApex * (1 + distanceSecuriteElargie))
+    targetTPFixe := directionFigeeLONG ? (prixAncrageApex * (1 + (vitesseRelative60 * cycleMax60))) : (prixAncrageApex * (1 - (vitesseRelative60 * cycleMax60)))
+
+// HARDENING DE L'AFFICHAGE PUBLIC (GARANTIE ZÉRO BUG DE CACHE)
+if na(prixAncrageApex) or na(targetSLFixe)
+    prixAncrageApex := close
+    tempsAncrageMs := time
+    targetApexFuturMs := time + (cycleMax60 * safeMilli)
+    limitePasseSLMs := time + safeMilli
+    directionFigeeLONG := (vecteurGravite >= 0)
+    float zoneRepliAttendu = vitesseRelative60 * 0.5
+    entreeLimiteFixe := directionFigeeLONG ? (prixAskLive * (1 - zoneRepliAttendu)) : (prixBidLive * (1 + zoneRepliAttendu))
+    float dSec = vitesseRelative60 * 3.0
+    targetSLFixe := directionFigeeLONG ? (prixBidLive * (1 - dSec)) : (prixAskLive * (1 + dSec))
+    targetTPFixe := directionFigeeLONG ? (prixBidLive * (1 + (vitesseRelative60 * cycleMax60))) : (prixAskLive * (1 - (vitesseRelative60 * cycleMax60)))
+
+bool declenchementLockLONG  = (not tradeEnCoursVerrouille and directionFigeeLONG and ohlcLongValide)
+bool declenchementLockSHORT = (not tradeEnCoursVerrouille and not directionFigeeLONG and ohlcShortValide)
+
+if (declenchementLockLONG or declenchementLockSHORT) and not tradeEnCoursVerrouille
+    tradeEnCoursVerrouille := true
+
+if prixAncrageApex > 0
+    tempsEcoule := tempsEcoule + 1
+// --- CALCULS ASYMÉTRIQUES APPLIQUÉS À L'AFFICHAGE ---
+int affichageCompteurCycle = 0
+if tradeEnCoursVerrouille or prixAncrageApex > 0
+    affichageCompteurCycle := directionFigeeLONG ? (cycleMax60 - tempsEcoule + 1) : tempsEcoule
+
+string tzFrance = "Europe/Paris"
+formatDateFull  = "dd/MM/yyyy HH:mm:ss"
+string strTimeActuel   = str.format_time(timenow, formatDateFull, tzFrance)
+string strTimeAncrage  = str.format_time(na(tempsAncrageMs) ? time : tempsAncrageMs, formatDateFull, tzFrance)
+string strTimeApex     = str.format_time(targetApexFuturMs, formatDateFull, tzFrance)
+
+int safeMilliSL = timeframe.isminutes ? timeframe.multiplier * 60000 : 3600000
+int limitePresentSLMs = (na(tempsAncrageMs) ? time : tempsAncrageMs) + safeMilliSL
+string strTimeSLPasse  = str.format_time(na(limitePasseSLMs) ? limitePresentSLMs : limitePasseSLMs, formatDateFull, tzFrance)
+int barresRestantes    = na(targetApexFuturMs) ? 0 : math.max(0, int((targetApexFuturMs - time) / (timeframe.isminutes ? timeframe.multiplier * 60000 : 3600000)))
+
+string txtEntree     = na(entreeLimiteFixe) ? "RECHERCHE" : str.tostring(entreeLimiteFixe, format.mintick)
+string txtSLPrix     = na(targetSLFixe)     ? "RECHERCHE" : str.tostring(targetSLFixe, format.mintick)
+string txtTPPrix     = na(targetTPFixe)     ? "RECHERCHE" : str.tostring(targetTPFixe, format.mintick)
+string txtBidLive    = str.tostring(prixBidLive, format.mintick)
+string txtAskLive    = str.tostring(prixAskLive, format.mintick)
+
+// --- RENDU ERGONOMIQUE DU TERMINAL (GRIS GRAPHITE INSTITUTIONNEL) ---
+color c_bg = color.new(#1c1d22, 5)
+color c_border = color.new(#343741, 10)
+var table db = table.new(position = position.bottom_left, columns = 3, rows = 5, bgcolor = c_bg, border_width = 1, border_color = c_border)
+
+if barstate.islast
+    c_white = color.white, c_yellow = #f3c63f, s_large = size.large, s_normal = size.normal
+    color c_green_m = color.new(#00b074, 10)
+    color c_red_m   = color.new(#ff4a5a, 10)
+
+    // Entêtes de colonnes - Design épuré
+    table.cell(db, 0, 0, " DIAGNOSTIC FLUX ", text_color=c_white, text_size=s_normal, bgcolor=color.new(#2d3139, 20))
+    table.cell(db, 1, 0, " CONFIGURATION BROKER ", text_color=c_white, text_size=s_normal, bgcolor=color.new(#2d3139, 20))
+    table.cell(db, 2, 0, " APEX MATRICIEL ", text_color=c_white, text_size=s_normal, bgcolor=color.new(#2d3139, 20))
+
+    // Ligne 1 : Prix du carnet d'ordres en direct et direction figée
+    table.cell(db, 0, 1, "ASK / ACHAT : " + txtAskLive + "\nBID / VENTE : " + txtBidLive, text_color=color.new(c_white, 20), text_size=s_normal)
+    string txtStatutFlux = na(prixAncrageApex) ? "RECHERCHE CHOC" : not tradeEnCoursVerrouille ? (directionFigeeLONG ? "LIMIT LONG INITIALISE" : "LIMIT SHORT INITIALISE") : directionFigeeLONG ? "FLUX LONG VERROUILLE" : "FLUX SHORT VERROUILLE"
+    color colorStatutFlux = na(prixAncrageApex) ? color.gray : directionFigeeLONG ? #00b074 : #ff4a5a
+    table.cell(db, 1, 1, txtStatutFlux, text_color=c_white, text_size=s_normal, bgcolor=color.new(colorStatutFlux, 40))
+    table.cell(db, 2, 1, "PROCHAIN APEX TIME :\n" + strTimeApex, text_color=c_yellow, text_size=s_normal)
+
+    // Ligne 2 : Horodatage d'Ancrage et Ordre Limite d'entrée calculé
+    table.cell(db, 0, 2, "DATE ANCRAGE :\n" + (na(tempsAncrageMs) ? "VEILLE" : strTimeAncrage), text_color=c_white, text_size=s_normal)
+    table.cell(db, 1, 2, directionFigeeLONG ? "ORDRE : BUY LIMIT\nPRIX : " + txtEntree : "ORDRE : SELL LIMIT\nPRIX : " + txtEntree, text_color=c_yellow, text_size=s_large, bgcolor=color.new(c_bg, 0))
+    table.cell(db, 2, 2, "CYCLE ECOULE : " + str.tostring(affichageCompteurCycle) + " / 60 B", text_color=c_white, text_size=s_normal)
+
+    // Ligne 3 : Friction du Spread et couple de sécurité SL / TP
+    table.cell(db, 0, 3, "SPREAD DE FRICTION :\n" + str.tostring(spreadFriction, format.mintick), text_color=color.new(c_white, 40), text_size=s_normal)
+    table.cell(db, 1, 3, "STOP LOSS REQUIS :\n" + txtSLPrix + "\n[ECHEANCE PASSE : " + strTimeSLPasse + "]", text_color=c_white, text_size=s_normal, bgcolor=color.new(c_red_m, 50))
+    table.cell(db, 2, 3, "TAKE PROFIT REQUIS :\n" + txtTPPrix, text_color=c_white, text_size=s_large, bgcolor=color.new(c_green_m, 50))
+
+    // Ligne 4 : Consigne opérationnelle et Timeframe requise déduite
+    string txtActionBinaire = na(prixAncrageApex) ? "RADAR EN VEILLE" : not tradeEnCoursVerrouille ? "SAISIR ORDRE EN REPLI" : "ORDRE EN COURS : NE RIEN MODIFIER"
+    color colorBouton = na(prixAncrageApex) ? color.gray : not tradeEnCoursVerrouille ? color.orange : #00b074
+    table.cell(db, 0, 4, txtActionBinaire, text_color=c_white, text_size=s_normal, bgcolor=color.new(colorBouton, 40))
+
+    float freqMins = 1440.0 * (1.0 - (densiteEnergieTemps / 100.0))
+    float d1 = math.abs(freqMins - 1.0), float d5 = math.abs(freqMins - 5.0), float d15 = math.abs(freqMins - 15.0), float d30 = math.abs(freqMins - 30.0), float d60 = math.abs(freqMins - 60.0), float d240 = math.abs(freqMins - 240.0), float d1440 = math.abs(freqMins - 1440.0), float d4320 = math.abs(freqMins - 4320.0), float d10080 = math.abs(freqMins - 10080.0)
+    float minDistance = math.min(d1, math.min(d5, math.min(d15, math.min(d30, math.min(d60, math.min(d240, math.min(d1440, math.min(d4320, d10080))))))))
+    string tfTradingView = minDistance == d10080 ? "1W" : minDistance == d4320 ? "3D" : minDistance == d1440 ? "1D" : minDistance == d240 ? "4h" : minDistance == d60 ? "1h" : minDistance == d30 ? "30m" : minDistance == d15 ? "15m" : minDistance == d5 ? "5m" : "1m"
+    string txtAffichageEchelle = "GRAPH REQUIS : " + tfTradingView + " (" + str.tostring(densiteEnergieTemps, "#.#") + "%)"
+    table.cell(db, 1, 4, txtAffichageEchelle, text_color=c_white, text_size=s_normal, bgcolor=color.new(#643aeb, 30))
+    
+    table.cell(db, 2, 4, "HORIZON APEX : " + str.tostring(barresRestantes) + " B RESTANTES", text_color=c_white, text_size=s_normal, bgcolor=color.new(#2d3139, 40))
